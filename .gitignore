@@ -27,7 +27,7 @@ venv/
 # Azure Functions
 .python_packages/
 .azure/
-lab-1/.build/
+.build/
 
 # Terraform local vars (contains subscription id — keep example only)
 **/terraform.tfvars

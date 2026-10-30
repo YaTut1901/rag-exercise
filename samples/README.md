@@ -1,12 +1,11 @@
 # Samples
 
 - **PDF** — put course invoices here locally (gitignored; do not commit).
-- **JSON examples** — [`examples/`](examples/) (`sample-prebuilt-read.json`, `sample-prebuilt-invoice.json`).
+- **JSON examples** — [`examples/`](examples/).
 
 Upload PDFs to Azure:
 
 ```bash
-cd lab-1
 ./scripts/upload_pdf.sh ./samples/*.pdf
 ```
 

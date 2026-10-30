@@ -3,6 +3,8 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+# shellcheck source=scripts/_common.sh
+source "$ROOT/scripts/_common.sh"
 TF_DIR="$ROOT/terraform"
 FUNC_DIR="$ROOT/function"
 ZIP_PATH="$ROOT/.build/function.zip"
@@ -36,6 +38,7 @@ az functionapp deployment source config-zip \
   --src "$ZIP_PATH" \
   --build-remote true
 
-echo "Waiting for app to settle..."
-sleep 15
+# Remote build + host restart often needs longer than a quick poll.
+wait_function_app_settle 30
 az functionapp function list --name "$FUNCTION_APP_NAME" --resource-group "$RESOURCE_GROUP" -o table
+

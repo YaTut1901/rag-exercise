@@ -1,49 +1,92 @@
-# rag-exercise — PDF recognition in Azure (RAG course)
+# rag-exercise — event-driven PDF pipeline in Azure (RAG course, Lab-2)
 
-Cloud PoC that watches an Azure Blob container for PDF invoices, runs Azure AI Document Intelligence OCR, and writes JSON results to separate output containers.
+Upload a PDF to Blob Storage; **Event Grid** enqueues work; **Azure Functions** classify the document, run Document Intelligence OCR when appropriate, write results, soft-delete the input, and email the uploader (with time-limited SAS links).
 
-Two functions are deployed in one Function App:
+Access to Storage, queues, tables, and Document Intelligence uses the Function App **system-assigned Managed Identity** (no storage/DI keys in app code). Classifier training uses the DI admin API key from the CLI script only.
 
-| Function | Model | Output container |
+## Pipeline functions
+
+| Function | Trigger queue | Role |
 |---|---|---|
-| `ocr_read` | `prebuilt-read` (general OCR) | `invoices-out-read` |
-| `ocr_invoice` | `prebuilt-invoice` (invoice fields) | `invoices-out-invoice` |
+| `ingress` | `q-ingress` | Dedup (`docHashes`), classify, route |
+| `extract_invoice` | `q-extract-invoice` | `prebuilt-invoice` → `invoices-out-invoice` |
+| `extract_read` | `q-extract-read` | `prebuilt-read` → `invoices-out-read` |
+| `extract_unknown` | `q-extract-unknown` | No OCR; `format_error` notify |
+| `delete_pdf_fn` | `q-delete-pdf` | Soft-delete PDF in `invoices-in` |
+| `delete_result` | `q-delete-result` | On result JSON delete → clear `docHashes` |
+| `notify` | `q-notify` | ACS Email to `uploaderEmail` metadata |
 
-Access to Blob Storage and Document Intelligence uses the Function App **system-assigned Managed Identity** (no API keys in code).
+Classifier labels: **invoice** / **other** / **unknown** (low confidence or missing model).
+
+Result blobs are named by content hash (`rawHash`), not upload file name:
+
+```text
+invoices-out-invoice/{rawHash}.pdf   # source copy (stable download link)
+invoices-out-invoice/{rawHash}.json  # OCR JSON
+# or invoices-out-read/… for "other"
+```
 
 ## Architecture
 
 ```mermaid
-flowchart LR
-  User([User / AzCopy]) -->|upload PDF| InBlob[(Blob: invoices-in)]
+flowchart TB
+  User([Uploader]) -->|upload PDF + uploaderEmail| In[(Blob: invoices-in)]
 
-  InBlob -->|blob trigger| FRead[Azure Function<br/>ocr_read]
-  InBlob -->|blob trigger| FInv[Azure Function<br/>ocr_invoice]
+  In -->|BlobCreated| EG1[Event Grid]
+  EG1 --> Qin[[q-ingress]]
+  Qin --> Ingress[ingress]
 
-  FRead -->|Managed Identity| DI[Azure AI Document Intelligence]
-  FInv -->|Managed Identity| DI
+  Ingress -->|new| DICls[DI custom classifier]
+  Ingress -->|duplicate processedHash| NDup[notify success + SAS]
+  Ingress -->|duplicate| Qdel[[q-delete-pdf]]
 
-  DI -->|prebuilt-read| FRead
-  DI -->|prebuilt-invoice| FInv
+  DICls -->|invoice| Qinv[[q-extract-invoice]]
+  DICls -->|other| Qread[[q-extract-read]]
+  DICls -->|unknown| Qunk[[q-extract-unknown]]
 
-  FRead -->|JSON| OutRead[(Blob: invoices-out-read)]
-  FInv -->|JSON| OutInv[(Blob: invoices-out-invoice)]
+  Qinv --> ExtInv[extract_invoice]
+  Qread --> ExtRead[extract_read]
+  Qunk --> ExtUnk[extract_unknown]
 
-  MI{{System-assigned<br/>Managed Identity}} -.->|Storage Blob Data Contributor| InBlob
-  MI -.->|Storage Blob Data Contributor| OutRead
-  MI -.->|Storage Blob Data Contributor| OutInv
-  MI -.->|Cognitive Services User| DI
+  ExtInv --> DIinv[DI prebuilt-invoice]
+  ExtRead --> DIread[DI prebuilt-read]
+
+  ExtInv --> OutInv[(invoices-out-invoice<br/>rawHash.pdf + rawHash.json)]
+  ExtRead --> OutRead[(invoices-out-read<br/>rawHash.pdf + rawHash.json)]
+
+  ExtInv --> Qn[[q-notify]]
+  ExtRead --> Qn
+  ExtUnk --> Qn
+  NDup --> Qn
+  ExtInv --> Qdel
+  ExtRead --> Qdel
+  ExtUnk --> Qdel
+
+  Qn --> Notify[notify / ACS Email]
+  Qdel --> DelPdf[delete_pdf_fn]
+
+  OutInv -->|BlobDeleted JSON| EG2[Event Grid]
+  OutRead -->|BlobDeleted JSON| EG2
+  EG2 --> Qres[[q-delete-result]]
+  Qres --> DelRes[delete_result → clear docHashes]
+
+  Table[(Table: docHashes)] -.-> Ingress
+  ExtInv -.-> Table
+  ExtRead -.-> Table
+  DelRes -.-> Table
 ```
 
-**Why separate output containers?** Writing JSON back into `invoices-in` would re-fire the blob triggers and create an infinite loop. Outputs are isolated from the input prefix.
+**Dedup:** SHA-256 of PDF bytes (`rawHash`) is stored in `docHashes`. If `processedHash` is already set, OCR is skipped; the uploader still gets a success-style email with SAS links to the existing `{rawHash}.pdf` / `{rawHash}.json`.
+
+**Why soft-delete + `delete_result`?** Deleting the result JSON clears the table row so the same PDF content can be processed again.
 
 ## Prerequisites
 
 - Azure subscription with student / free credits
 - [Azure CLI](https://learn.microsoft.com/cli/azure/install-azure-cli) (`az`)
 - [Terraform](https://developer.hashicorp.com/terraform/install) ≥ 1.5
-- `zip` utility
-- Sample invoices: [Google Drive folder](https://drive.google.com/drive/folders/1xhidQsx2mOAF0QpWY4ldkow5wxbUM0Vr)
+- `zip`, Python 3 with `azure-ai-documentintelligence` + `azure-storage-blob` (for classifier training)
+- Sample PDFs under `samples/examples/{invoice,other}/` (≥5 each for training)
 
 ## Deploy
 
@@ -68,62 +111,55 @@ terraform apply
 
 Resources created:
 
-- Resource group `rg-rag-lab1`
-- Storage account + containers `invoices-in`, `invoices-out-read`, `invoices-out-invoice`
-- Azure AI Document Intelligence (`FormRecognizer` / S0)
-- Linux Consumption Function App (Python 3.11) + Application Insights
-- Role assignments for Managed Identity
+- Resource group, storage (containers `invoices-in`, `invoices-out-*`, `classifier-train`, soft-delete), queues, `docHashes` table
+- Event Grid system topic + subscriptions (BlobCreated → `q-ingress`, BlobDeleted on outs → `q-delete-result`)
+- Document Intelligence, Linux Consumption Function App (Python 3.11), Application Insights
+- Azure Communication Services + Email (notifications)
+- Managed Identity role assignments (blob / queue / table / Cognitive Services User)
 
 ### 3. Deploy function code
 
 ```bash
-chmod +x scripts/deploy_function.sh
+chmod +x scripts/*.sh
 ./scripts/deploy_function.sh
 ```
 
-### 4. Test with a PDF
-
-Put files into `samples/` and upload:
+### 4. Train the custom classifier
 
 ```bash
-chmod +x scripts/upload_pdf.sh
-./scripts/upload_pdf.sh ./samples/invoice-01.pdf
+./scripts/train_classifier.sh
 ```
 
-or by hands:
+Builds Document Intelligence classifier `rag-invoice-classifier` from `samples/examples/{invoice,other}` and sets `CLASSIFIER_MODEL_ID` on the Function App (and in `terraform.tfvars`).
+
+Do **not** put unknown/smoke PDFs into those train folders.
+
+### 5. Test with a PDF
 
 ```bash
-az storage blob upload \
-  --account-name ragocrstcp2689 \
-  --container-name invoices-in \
-  --file ./samples/invoice-01.pdf \
-  --name invoice-01.pdf \
-  --auth-mode login
+./scripts/upload_pdf.sh ./samples/examples/invoice/INV20240116-092.pdf
 ```
 
-After 1-2 minutes json files appear:
+The script sets blob metadata `uploaderEmail` for ACS notify.
 
-- `invoices-out-read/invoice-01.json` ← `ocr_read` / `prebuilt-read`
-- `invoices-out-invoice/invoice-01.json` ← `ocr_invoice` / `prebuilt-invoice`
+After ~1–2 minutes:
+
+- Input PDF is soft-deleted from `invoices-in`
+- Results appear as `{rawHash}.pdf` + `{rawHash}.json` under `invoices-out-invoice` or `invoices-out-read`
+- Email arrives with SAS links to both files
 
 ```bash
-STORAGE=ragocrstcp2689
-az storage blob download --account-name "$STORAGE" --container-name invoices-out-invoice \
-  --name invoice-01.json --file ./invoice-01.invoice.json --auth-mode login
+STORAGE="$(terraform -chdir=terraform output -raw storage_account_name)"
+FUNC="$(terraform -chdir=terraform output -raw function_app_name)"
+RG="$(terraform -chdir=terraform output -raw resource_group_name)"
 
-az functionapp log tail --name ragocr-func-cp2689 --resource-group rg-rag-lab1
+az storage blob list --account-name "$STORAGE" --container-name invoices-out-invoice \
+  --auth-mode login -o table
+
+az functionapp log tail --name "$FUNC" --resource-group "$RG"
 ```
 
-**Deployed resources (switzerlandnorth):**
-
-| Resource | Name |
-|---|---|
-| Resource group | `rg-rag-lab1` |
-| Storage | `ragocrstcp2689` |
-| Function App | `ragocr-func-cp2689` (`ocr_read`, `ocr_invoice`) |
-| Document Intelligence | `ragocr-di-cp2689` (F0) |
-
-### 5. Tear down (after defence)
+### 6. Tear down (after defence)
 
 ```bash
 cd terraform && terraform destroy
@@ -131,77 +167,77 @@ cd terraform && terraform destroy
 
 ## Example JSON
 
-Illustrative excerpts (full samples in [`samples/examples/`](samples/examples/)):
+Illustrative excerpts (normalized by `shared/ocr.py`):
 
 **`prebuilt-read`** — page text + line polygons, empty `invoiceFields`:
 
 ```json
 {
-  "sourceBlob": "invoice-01.pdf",
+  "sourceBlob": "upload-name.pdf",
   "modelId": "prebuilt-read",
   "pageCount": 1,
-  "content": "INVOICE\nContoso Ltd\nInvoice Number: INV-1001\n...",
-  "pages": [{ "pageNumber": 1, "lines": [{ "content": "INVOICE", "polygon": [...] }] }],
+  "content": "…",
+  "pages": [{ "pageNumber": 1, "lines": [{ "content": "…", "polygon": [] }] }],
   "invoiceFields": {}
 }
 ```
 
-**`prebuilt-invoice`** — same layout plus typed fields (`VendorName`, `InvoiceId`, `InvoiceDate`, `InvoiceTotal`, line items):
+**`prebuilt-invoice`** — same layout plus typed fields (`VendorName`, `InvoiceId`, `InvoiceTotal`, …):
 
 ```json
 {
-  "sourceBlob": "invoice-01.pdf",
+  "sourceBlob": "upload-name.pdf",
   "modelId": "prebuilt-invoice",
   "invoiceFields": {
     "VendorName": { "type": "string", "valueString": "Contoso Ltd", "confidence": 0.97 },
-    "InvoiceId": { "type": "string", "valueString": "INV-1001", "confidence": 0.98 },
-    "InvoiceTotal": { "type": "currency", "valueCurrency": { "amount": 1250.0, "currencyCode": "USD" } }
+    "InvoiceId": { "type": "string", "valueString": "INV-1001", "confidence": 0.98 }
   }
 }
 ```
 
-### Read vs invoice model
-
 | | `prebuilt-read` | `prebuilt-invoice` |
 |---|---|---|
-| Goal | Layout + plain text OCR | Structured invoice extraction |
-| Key output | `content`, `pages[].lines` | `invoiceFields` (vendor, dates, totals, items) |
-| Best for | Any PDF / later RAG citations | Accounting / invoice pipelines |
-
-Both results store `pageNumber` so later RAG answers can cite a page.
+| When | Classifier → **other** | Classifier → **invoice** |
+| Goal | Layout + plain text | Structured invoice fields |
+| Best for | Non-invoice docs / RAG text | Accounting-style invoices |
 
 ## Cost estimate (1000 documents / month)
 
-Assumptions: average **2 pages** per invoice → **2000 pages/month**; Switzerland North (`switzerlandnorth` — allowed by Azure for Students region policy and supports Linux Consumption Functions); both models run on every upload (as in this PoC). Note: lab deploy uses Document Intelligence **F0** (free, ~500 pages/month). Paid S0 pricing is shown below for the 1000-doc scenario.
+Assumptions: average **2 pages** per doc → **2000 pages/month**; classify once + **one** extract model per document (not both); Switzerland North; lab often uses Document Intelligence **F0** (free tier limits). Paid S0-style estimates:
 
-| Service | Pricing basis (approx.) | Estimate |
-|---|---|---|
-| Document Intelligence `prebuilt-read` | ~$1.50 / 1000 pages | 2000 × $0.0015 ≈ **$3.00** |
-| Document Intelligence `prebuilt-invoice` | ~$10 / 1000 pages (S0 custom/prebuilt invoice tier) | 2000 × $0.01 ≈ **$20.00** |
-| Azure Functions (Consumption) | first 1M executions + 400k GB-s free | **~$0** at this volume |
-| Blob Storage (few GB + transactions) | LRS cool/hot | **<$1** |
-| Application Insights | first 5 GB/month free | **~$0** |
+| Service | Estimate |
+|---|---|
+| Custom classify + one prebuilt extract | roughly **$5–25** depending on invoice vs read mix |
+| Functions Consumption + queues + small blob/table | **~$0–2** |
+| ACS Email (low volume) | check current ACS pricing |
+| Application Insights | often free tier at this volume |
 
-**Total ≈ $24–30 / month** when both models process every document.
-
-If you keep only `prebuilt-invoice` in production: **≈ $20–22 / month**.  
-Verify with the [Azure Pricing Calculator](https://azure.microsoft.com/pricing/calculator/) for your region and SKU.
+Verify with the [Azure Pricing Calculator](https://azure.microsoft.com/pricing/calculator/).
 
 ## Project layout
 
 ```
 rag-exercise/
-  terraform/          # Azure IaC + local state
-  function/           # Azure Functions (Python v2)
-    function_app.py   # ocr_read + ocr_invoice
-    shared/ocr.py
+  terraform/                 # IaC (storage, EG, queues, table, DI, Functions, ACS)
+  function/
+    function_app.py          # ingress / extract_* / delete_* / notify
+    shared/
+      classify.py            # custom classifier
+      ocr.py                 # DI extract + JSON normalize
+      dochashes.py           # Table Storage dedup
+      storage.py             # MI clients + SAS links
+      events.py              # queue JSON helpers
+      notify_email.py        # ACS email
     requirements.txt
     host.json
   scripts/
+    _common.sh               # RBAC / settle waits
     deploy_function.sh
+    train_classifier.sh
     upload_pdf.sh
-  samples/            # local PDFs (gitignored)
-    examples/         # sample invoices / JSON
+  samples/examples/
+    invoice/                 # ≥5 PDFs for classifier class "invoice"
+    other/                   # ≥5 PDFs for class "other"
   README.md
 ```
 

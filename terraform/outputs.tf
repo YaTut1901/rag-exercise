@@ -33,3 +33,28 @@ output "output_container_invoice" {
 output "upload_example" {
   value = "az storage blob upload --account-name ${azurerm_storage_account.docs.name} --container-name invoices-in --file ./sample.pdf --name sample.pdf --auth-mode login"
 }
+
+output "queues" {
+  value = local.queue_names
+}
+
+output "doc_hashes_table" {
+  value = azurerm_storage_table.doc_hashes.name
+}
+
+output "acs_email_sender" {
+  value = "DoNotReply@${azurerm_email_communication_service_domain.azure_managed.from_sender_domain}"
+}
+
+output "eventgrid_system_topic" {
+  value = azurerm_eventgrid_system_topic.storage.name
+}
+
+output "classifier_train_container" {
+  value = azurerm_storage_container.classifier_train.name
+}
+
+output "classifier_model_id" {
+  value       = var.classifier_model_id
+  description = "Set via scripts/train_classifier.sh after training (also written to Function app settings)"
+}

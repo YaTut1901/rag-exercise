@@ -85,14 +85,15 @@ def normalize_result(
     }
 
 
-def save_json(container_name: str, blob_name: str, payload: dict[str, Any]) -> str:
+def save_json(container_name: str, blob_name: str, payload: dict[str, Any]) -> tuple[str, bytes]:
+    """Upload JSON; return (container/blob path, exact UTF-8 bytes written)."""
     service = _blob_service()
     container = service.get_container_client(container_name)
     data = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
     blob = container.get_blob_client(blob_name)
     blob.upload_blob(data, overwrite=True, content_type="application/json")
     logger.info("Wrote result to %s/%s (%d bytes)", container_name, blob_name, len(data))
-    return f"{container_name}/{blob_name}"
+    return f"{container_name}/{blob_name}", data
 
 
 def pdf_name_to_json_name(blob_name: str) -> str:

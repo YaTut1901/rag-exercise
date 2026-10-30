@@ -34,6 +34,12 @@ resource "azurerm_storage_account" "docs" {
   allow_nested_items_to_be_public = false
   shared_access_key_enabled       = true
 
+  blob_properties {
+    delete_retention_policy {
+      days = var.blob_soft_delete_days
+    }
+  }
+
   tags = azurerm_resource_group.lab1.tags
 }
 
@@ -145,14 +151,31 @@ resource "azurerm_linux_function_app" "ocr" {
     AzureWebJobsFeatureFlags       = "EnableWorkerIndexing"
     FUNCTIONS_WORKER_RUNTIME       = "python"
     DOCUMENT_INTELLIGENCE_ENDPOINT = azurerm_cognitive_account.document_intelligence.endpoint
+    CLASSIFIER_MODEL_ID            = var.classifier_model_id
+    CLASSIFY_MIN_CONFIDENCE        = tostring(var.classify_min_confidence)
+    QUEUE_MAX_DEQUEUE_COUNT        = tostring(var.queue_max_dequeue_count)
     OUTPUT_CONTAINER_READ          = azurerm_storage_container.invoices_out_read.name
     OUTPUT_CONTAINER_INVOICE       = azurerm_storage_container.invoices_out_invoice.name
     INPUT_CONTAINER                = azurerm_storage_container.invoices_in.name
+    TABLE_DOC_HASHES               = azurerm_storage_table.doc_hashes.name
+    BLOB_SOFT_DELETE_DAYS          = tostring(var.blob_soft_delete_days)
 
-    # Identity-based connection for blob triggers (blob + queue required) + SDK writes
+    QUEUE_INGRESS          = azurerm_storage_queue.ingress.name
+    QUEUE_EXTRACT_INVOICE  = azurerm_storage_queue.extract_invoice.name
+    QUEUE_EXTRACT_READ     = azurerm_storage_queue.extract_read.name
+    QUEUE_EXTRACT_UNKNOWN  = azurerm_storage_queue.extract_unknown.name
+    QUEUE_DELETE_PDF       = azurerm_storage_queue.delete_pdf.name
+    QUEUE_DELETE_RESULT    = azurerm_storage_queue.delete_result.name
+    QUEUE_NOTIFY           = azurerm_storage_queue.notify.name
+
+    # Identity-based connection for queues/blobs/tables + SDK writes
     "DOCUMENTS_STORAGE__blobServiceUri"  = "https://${azurerm_storage_account.docs.name}.blob.core.windows.net"
     "DOCUMENTS_STORAGE__queueServiceUri" = "https://${azurerm_storage_account.docs.name}.queue.core.windows.net"
+    "DOCUMENTS_STORAGE__tableServiceUri" = "https://${azurerm_storage_account.docs.name}.table.core.windows.net"
     "DOCUMENTS_STORAGE__credential"      = "managedidentity"
+
+    ACS_EMAIL_CONNECTION_STRING = azurerm_communication_service.notify.primary_connection_string
+    ACS_EMAIL_SENDER            = "DoNotReply@${azurerm_email_communication_service_domain.azure_managed.from_sender_domain}"
 
     APPINSIGHTS_INSTRUMENTATIONKEY        = azurerm_application_insights.lab1.instrumentation_key
     APPLICATIONINSIGHTS_CONNECTION_STRING = azurerm_application_insights.lab1.connection_string
@@ -164,6 +187,8 @@ resource "azurerm_linux_function_app" "ocr" {
     azurerm_storage_container.invoices_in,
     azurerm_storage_container.invoices_out_read,
     azurerm_storage_container.invoices_out_invoice,
+    azurerm_storage_queue.ingress,
+    azurerm_storage_table.doc_hashes,
     time_sleep.storage_ready,
   ]
 
@@ -181,6 +206,18 @@ resource "azurerm_linux_function_app" "ocr" {
 resource "azurerm_role_assignment" "func_blob_data" {
   scope                = azurerm_storage_account.docs.id
   role_definition_name = "Storage Blob Data Contributor"
+  principal_id         = azurerm_linux_function_app.ocr.identity[0].principal_id
+}
+
+resource "azurerm_role_assignment" "func_queue_data" {
+  scope                = azurerm_storage_account.docs.id
+  role_definition_name = "Storage Queue Data Contributor"
+  principal_id         = azurerm_linux_function_app.ocr.identity[0].principal_id
+}
+
+resource "azurerm_role_assignment" "func_table_data" {
+  scope                = azurerm_storage_account.docs.id
+  role_definition_name = "Storage Table Data Contributor"
   principal_id         = azurerm_linux_function_app.ocr.identity[0].principal_id
 }
 

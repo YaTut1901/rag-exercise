@@ -2,3 +2,9 @@ subscription_id     = "00000000-0000-0000-0000-000000000000"
 location            = "switzerlandnorth"
 prefix              = "raglab1"
 resource_group_name = "rg-rag-lab1"
+
+# Lab-2: set after training a custom classifier in Document Intelligence Studio
+classifier_model_id     = ""
+classify_min_confidence = 0.6
+blob_soft_delete_days   = 7
+acs_data_location       = "Europe"

@@ -8,3 +8,9 @@ classifier_model_id     = ""
 classify_min_confidence = 0.6
 blob_soft_delete_days   = 7
 acs_data_location       = "Europe"
+
+# Lab-3 RAG: Azure OpenAI is often not in switzerlandnorth
+openai_location = "swedencentral"
+
+# Public Streamlit UI App Service plan (B3 recommended: Streamlit+plotly)
+ui_sku_name = "B3"

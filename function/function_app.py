@@ -26,6 +26,12 @@ from shared.events import (
 )
 from shared.hashes import sha256_hex
 from shared.notify_email import send_email
+from shared.db import (
+    delete_doc_chunks_by_raw_hash,
+    delete_invoice_by_processed_hash,
+    upsert_invoice,
+)
+from shared.index_docs import index_document_payload
 from shared.ocr import analyze_document, normalize_result, save_json
 from shared.storage import (
     blob_exists,
@@ -331,12 +337,7 @@ def _run_extract(
         started = time.perf_counter()
         raw = analyze_document(model_id, pdf_bytes)
         duration = time.perf_counter() - started
-        payload = normalize_result(
-            source_blob=blob_name,
-            model_id=model_id,
-            duration_sec=duration,
-            raw=raw,
-        )
+        payload = normalize_result(model_id=model_id, raw=raw)
         # Deterministic names from content hash — no result path in docHashes.
         pdf_out = _raw_hash_pdf_name(raw_hash)
         json_out = _raw_hash_json_name(raw_hash)
@@ -348,6 +349,18 @@ def _run_extract(
         )
         _, json_bytes = save_json(output_container, json_out, payload)
         processed_hash = sha256_hex(json_bytes)
+        if model_id == "prebuilt-invoice":
+            upsert_invoice(
+                processed_hash=processed_hash,
+                raw_hash=raw_hash,
+                payload=payload,
+            )
+        elif model_id == "prebuilt-read":
+            index_document_payload(
+                raw_hash=raw_hash,
+                source_file=blob_name,
+                payload=payload,
+            )
         set_processed_hash(raw_hash, processed_hash)
 
         message = _extract_ok_message(
@@ -514,6 +527,16 @@ def delete_result(msg: func.QueueMessage) -> None:
         content = download_blob_bytes(container, blob_name)
         processed_hash = sha256_hex(content)
         found = delete_by_processed_hash(processed_hash)
+        invoice_out = os.environ.get("OUTPUT_CONTAINER_INVOICE", "invoices-out-invoice")
+        read_out = os.environ.get("OUTPUT_CONTAINER_READ", "invoices-out-read")
+        if container == invoice_out:
+            delete_invoice_by_processed_hash(processed_hash)
+        elif container == read_out:
+            # Blob name is {rawHash}.json — same key used when indexing chunks.
+            raw_from_name = blob_name.rsplit("/", 1)[-1]
+            if raw_from_name.lower().endswith(".json"):
+                raw_from_name = raw_from_name[:-5]
+            delete_doc_chunks_by_raw_hash(raw_from_name)
         if not found:
             logger.warning(
                 "delete_result: no table row for processedHash=%s blob=%s (echo; skip re-delete)",

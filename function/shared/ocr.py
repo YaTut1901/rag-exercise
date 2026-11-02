@@ -15,6 +15,18 @@ from azure.storage.blob import BlobServiceClient
 
 logger = logging.getLogger(__name__)
 
+_VALUE_KEYS = (
+    "valueString",
+    "valueNumber",
+    "valueInteger",
+    "valueDate",
+    "valueTime",
+    "valuePhoneNumber",
+    "valueCountryRegion",
+    "valueSelectionMark",
+    "valueBoolean",
+)
+
 
 def _di_client() -> DocumentIntelligenceClient:
     endpoint = os.environ["DOCUMENT_INTELLIGENCE_ENDPOINT"]
@@ -40,48 +52,112 @@ def analyze_document(model_id: str, pdf_bytes: bytes) -> dict[str, Any]:
     return result.as_dict()
 
 
-def normalize_result(
-    *,
-    source_blob: str,
-    model_id: str,
-    duration_sec: float,
-    raw: dict[str, Any],
-) -> dict[str, Any]:
-    """Keep pages + content for lab-3 citations; keep full SDK payload under raw."""
-    raw_pages = raw.get("pages") or []
+def _field_value(field: dict[str, Any]) -> Any:
+    """Extract a plain value from a Document Intelligence field dict."""
+    for key in _VALUE_KEYS:
+        if key in field and field[key] is not None:
+            return field[key]
+    currency = field.get("valueCurrency")
+    if isinstance(currency, dict):
+        amount = currency.get("amount")
+        code = currency.get("currencyCode") or currency.get("currencySymbol")
+        if amount is not None and code:
+            return {"amount": amount, "currency": code}
+        return amount
+    address = field.get("valueAddress")
+    if isinstance(address, dict):
+        return address
+    return field.get("content")
+
+
+def _simplify_field(field: Any) -> Any:
+    """Reduce DI field tree to value + confidence (objects/arrays recursively)."""
+    if not isinstance(field, dict):
+        return field
+
+    if "valueArray" in field:
+        items = [_simplify_field(item) for item in (field.get("valueArray") or [])]
+        conf = field.get("confidence")
+        if conf is None:
+            return items
+        return {"value": items, "confidence": conf}
+
+    if "valueObject" in field:
+        obj = field.get("valueObject") or {}
+        simplified = {
+            name: _simplify_field(child) for name, child in obj.items() if isinstance(child, dict)
+        }
+        conf = field.get("confidence")
+        if conf is None:
+            return simplified
+        return {"value": simplified, "confidence": conf}
+
+    return {
+        "value": _field_value(field),
+        "confidence": field.get("confidence"),
+    }
+
+
+def _simplify_invoice_fields(fields: dict[str, Any]) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    for name, field in fields.items():
+        if not isinstance(field, dict):
+            continue
+        # Line items: expose as a plain list of row objects.
+        if name == "Items" and "valueArray" in field:
+            rows = []
+            for item in field.get("valueArray") or []:
+                if isinstance(item, dict) and "valueObject" in item:
+                    row = item.get("valueObject") or {}
+                    rows.append(
+                        {
+                            k: _simplify_field(v)
+                            for k, v in row.items()
+                            if isinstance(v, dict)
+                        }
+                    )
+                else:
+                    rows.append(_simplify_field(item))
+            out[name] = {
+                "value": rows,
+                "confidence": field.get("confidence"),
+            }
+        else:
+            out[name] = _simplify_field(field)
+    return out
+
+
+def _pages_with_text(raw: dict[str, Any]) -> list[dict[str, Any]]:
     pages = []
-    for page in raw_pages:
+    for page in raw.get("pages") or []:
+        lines = page.get("lines") or []
+        text = "\n".join(
+            (line.get("content") or "") for line in lines if isinstance(line, dict)
+        )
         pages.append(
             {
                 "pageNumber": page.get("pageNumber"),
-                "width": page.get("width"),
-                "height": page.get("height"),
-                "unit": page.get("unit"),
-                "lines": [
-                    {
-                        "content": line.get("content"),
-                        "polygon": line.get("polygon"),
-                    }
-                    for line in (page.get("lines") or [])
-                ],
+                "text": text,
             }
         )
+    return pages
 
-    documents = raw.get("documents") or []
-    fields: dict[str, Any] = {}
-    if documents:
-        fields = documents[0].get("fields") or {}
+
+def normalize_result(*, model_id: str, raw: dict[str, Any]) -> dict[str, Any]:
+    """Build compact JSON: document pages text, or invoice fields only."""
+    if model_id == "prebuilt-invoice":
+        documents = raw.get("documents") or []
+        fields: dict[str, Any] = {}
+        if documents:
+            fields = documents[0].get("fields") or {}
+        return {
+            "type": "invoice",
+            "fields": _simplify_invoice_fields(fields),
+        }
 
     return {
-        "sourceBlob": source_blob,
-        "modelId": model_id,
-        "processedAtUtc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        "durationSeconds": round(duration_sec, 3),
-        "pageCount": len(raw_pages),
-        "content": raw.get("content"),
-        "pages": pages,
-        "invoiceFields": fields,
-        "raw": raw,
+        "type": "document",
+        "pages": _pages_with_text(raw),
     }
 
 
@@ -120,20 +196,20 @@ def process_pdf(
     try:
         raw = analyze_document(model_id, pdf_bytes)
         duration = time.perf_counter() - started
-        payload = normalize_result(
-            source_blob=source_blob,
-            model_id=model_id,
-            duration_sec=duration,
-            raw=raw,
-        )
+        payload = normalize_result(model_id=model_id, raw=raw)
         out_name = pdf_name_to_json_name(source_blob)
         save_json(output_container, out_name, payload)
+        detail = (
+            f"fields={len(payload.get('fields') or {})}"
+            if payload.get("type") == "invoice"
+            else f"pages={len(payload.get('pages') or [])}"
+        )
         logger.info(
-            "Finished OCR model=%s source=%s duration=%.3fs pages=%s",
+            "Finished OCR model=%s source=%s duration=%.3fs %s",
             model_id,
             source_blob,
             duration,
-            payload.get("pageCount"),
+            detail,
         )
         return payload
     except Exception:

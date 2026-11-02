@@ -34,3 +34,42 @@ wait_function_app_settle() {
   echo "Waiting ${seconds}s for Function App to settle..."
   sleep "$seconds"
 }
+
+# Storage account denies public data-plane; admin scripts temporarily allow this IP.
+storage_allow_my_ip() {
+  local account="$1"
+  local rg="$2"
+  local rule_name="${3:-allow-admin-local}"
+  local myip
+
+  myip="$(curl -4 -s https://api.ipify.org || true)"
+  if [[ -z "$myip" ]]; then
+    echo "ERROR: could not detect public IP for storage firewall" >&2
+    return 1
+  fi
+  echo "Allowing $myip on storage $account ($rule_name)…"
+  az storage account network-rule add \
+    --account-name "$account" \
+    --resource-group "$rg" \
+    --ip-address "$myip" \
+    -o none 2>/dev/null \
+  || true
+  # Propagation can lag a few seconds.
+  sleep 5
+}
+
+storage_remove_my_ip() {
+  local account="$1"
+  local rg="$2"
+  local myip
+
+  myip="$(curl -4 -s https://api.ipify.org || true)"
+  [[ -n "$myip" ]] || return 0
+  echo "Removing $myip from storage $account firewall…"
+  az storage account network-rule remove \
+    --account-name "$account" \
+    --resource-group "$rg" \
+    --ip-address "$myip" \
+    -o none 2>/dev/null \
+  || true
+}

@@ -30,8 +30,12 @@ output "output_container_invoice" {
   value = azurerm_storage_container.invoices_out_invoice.name
 }
 
-output "upload_example" {
-  value = "az storage blob upload --account-name ${azurerm_storage_account.docs.name} --container-name invoices-in --file ./sample.pdf --name sample.pdf --auth-mode login"
+output "ui_app_name" {
+  value = azurerm_linux_web_app.ui.name
+}
+
+output "ui_url" {
+  value = "https://${azurerm_linux_web_app.ui.default_hostname}"
 }
 
 output "queues" {
@@ -57,4 +61,32 @@ output "classifier_train_container" {
 output "classifier_model_id" {
   value       = var.classifier_model_id
   description = "Set via scripts/train_classifier.sh after training (also written to Function app settings)"
+}
+
+output "postgres_fqdn" {
+  value = azurerm_postgresql_flexible_server.invoices.fqdn
+}
+
+output "postgres_database_name" {
+  value = azurerm_postgresql_flexible_server_database.invoices.name
+}
+
+output "postgres_admin_login" {
+  value = var.postgres_admin_login
+}
+
+output "openai_endpoint" {
+  value = azurerm_cognitive_account.openai.endpoint
+}
+
+output "openai_embedding_deployment" {
+  value = azurerm_cognitive_deployment.embeddings.name
+}
+
+output "openai_chat_deployment" {
+  value = azurerm_cognitive_deployment.chat.name
+}
+
+output "openai_location" {
+  value = var.openai_location
 }

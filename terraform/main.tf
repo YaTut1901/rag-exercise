@@ -33,6 +33,9 @@ resource "azurerm_storage_account" "docs" {
 
   allow_nested_items_to_be_public = false
   shared_access_key_enabled       = true
+  # Public endpoint stays on; Deny rules live in azurerm_storage_account_network_rules
+  # (must allow UI App Service outbound IPs — MI alone is not enough).
+  public_network_access_enabled = true
 
   blob_properties {
     delete_retention_policy {
@@ -145,6 +148,10 @@ resource "azurerm_linux_function_app" "ocr" {
     }
     application_insights_connection_string = azurerm_application_insights.lab1.connection_string
     application_insights_key               = azurerm_application_insights.lab1.instrumentation_key
+
+    # Queue/blob triggers only — no public HTTP API. SCM stays open for zip deploy.
+    ip_restriction_default_action     = "Deny"
+    scm_ip_restriction_default_action = "Allow"
   }
 
   app_settings = {
@@ -160,13 +167,13 @@ resource "azurerm_linux_function_app" "ocr" {
     TABLE_DOC_HASHES               = azurerm_storage_table.doc_hashes.name
     BLOB_SOFT_DELETE_DAYS          = tostring(var.blob_soft_delete_days)
 
-    QUEUE_INGRESS          = azurerm_storage_queue.ingress.name
-    QUEUE_EXTRACT_INVOICE  = azurerm_storage_queue.extract_invoice.name
-    QUEUE_EXTRACT_READ     = azurerm_storage_queue.extract_read.name
-    QUEUE_EXTRACT_UNKNOWN  = azurerm_storage_queue.extract_unknown.name
-    QUEUE_DELETE_PDF       = azurerm_storage_queue.delete_pdf.name
-    QUEUE_DELETE_RESULT    = azurerm_storage_queue.delete_result.name
-    QUEUE_NOTIFY           = azurerm_storage_queue.notify.name
+    QUEUE_INGRESS         = azurerm_storage_queue.ingress.name
+    QUEUE_EXTRACT_INVOICE = azurerm_storage_queue.extract_invoice.name
+    QUEUE_EXTRACT_READ    = azurerm_storage_queue.extract_read.name
+    QUEUE_EXTRACT_UNKNOWN = azurerm_storage_queue.extract_unknown.name
+    QUEUE_DELETE_PDF      = azurerm_storage_queue.delete_pdf.name
+    QUEUE_DELETE_RESULT   = azurerm_storage_queue.delete_result.name
+    QUEUE_NOTIFY          = azurerm_storage_queue.notify.name
 
     # Identity-based connection for queues/blobs/tables + SDK writes
     "DOCUMENTS_STORAGE__blobServiceUri"  = "https://${azurerm_storage_account.docs.name}.blob.core.windows.net"
@@ -176,6 +183,13 @@ resource "azurerm_linux_function_app" "ocr" {
 
     ACS_EMAIL_CONNECTION_STRING = azurerm_communication_service.notify.primary_connection_string
     ACS_EMAIL_SENDER            = "DoNotReply@${azurerm_email_communication_service_domain.azure_managed.from_sender_domain}"
+
+    DATABASE_URL = local.postgres_database_url
+
+    AZURE_OPENAI_ENDPOINT             = azurerm_cognitive_account.openai.endpoint
+    AZURE_OPENAI_EMBEDDING_DEPLOYMENT = azurerm_cognitive_deployment.embeddings.name
+    AZURE_OPENAI_CHAT_DEPLOYMENT      = azurerm_cognitive_deployment.chat.name
+    AZURE_OPENAI_EMBEDDING_DIMENSIONS = tostring(var.openai_embedding_dimensions)
 
     APPINSIGHTS_INSTRUMENTATIONKEY        = azurerm_application_insights.lab1.instrumentation_key
     APPLICATIONINSIGHTS_CONNECTION_STRING = azurerm_application_insights.lab1.connection_string
@@ -189,6 +203,11 @@ resource "azurerm_linux_function_app" "ocr" {
     azurerm_storage_container.invoices_out_invoice,
     azurerm_storage_queue.ingress,
     azurerm_storage_table.doc_hashes,
+    azurerm_postgresql_flexible_server_database.invoices,
+    azurerm_postgresql_flexible_server_firewall_rule.allow_azure,
+    azurerm_postgresql_flexible_server_configuration.azure_extensions,
+    azurerm_cognitive_deployment.embeddings,
+    azurerm_cognitive_deployment.chat,
     time_sleep.storage_ready,
   ]
 

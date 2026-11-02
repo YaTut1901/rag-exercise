@@ -32,6 +32,11 @@ done
 SCOPE="$(az storage account show -n "$STORAGE" -g "$RG" --query id -o tsv)"
 ASSIGNEE="$(az ad signed-in-user show --query id -o tsv)"
 az role assignment create --assignee "$ASSIGNEE" --role "Storage Blob Data Contributor" --scope "$SCOPE" 2>/dev/null || true
+
+# Storage data-plane is Deny-by-default; temporarily allow this admin IP.
+storage_allow_my_ip "$STORAGE" "$RG"
+trap 'storage_remove_my_ip "'"$STORAGE"'" "'"$RG"'"' EXIT
+
 wait_blob_data_rbac "$STORAGE" "$TRAIN_CONTAINER"
 
 echo "Uploading PDFs → $STORAGE/$TRAIN_CONTAINER/"

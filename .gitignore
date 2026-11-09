@@ -22,6 +22,7 @@ __pycache__/
 *.py[cod]
 .venv/
 venv/
+agent/.venv/
 .python_packages/
 
 # Azure Functions
